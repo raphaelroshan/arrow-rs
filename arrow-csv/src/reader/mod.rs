@@ -280,6 +280,7 @@ pub struct Format {
     comment: Option<u8>,
     null_regex: NullRegex,
     truncated_rows: bool,
+    strict_inference: bool,
 }
 
 impl Format {
@@ -340,6 +341,17 @@ impl Format {
         self
     }
 
+    /// Whether to use strict schema inference, defaults to `false`.
+    ///
+    /// By default a field is always inferred as nullable, since only a sample of the data
+    /// may be inspected during inference. When set to `true`, a field is inferred as
+    /// non-nullable if no null values were observed for it while inferring the schema. If
+    /// the reader later encounters a null in such a field it will return an error.
+    pub fn with_strict_schema_inference(mut self, strict: bool) -> Self {
+        self.strict_inference = strict;
+        self
+    }
+
     /// Infer schema of CSV records from the provided `reader`
     ///
     /// If `max_records` is `None`, all records will be read, otherwise up to `max_records`
@@ -368,6 +380,8 @@ impl Format {
         let header_length = headers.len();
         // keep track of inferred field types
         let mut column_types: Vec<InferredDataType> = vec![Default::default(); header_length];
+        // keep track of whether a null value was observed for each column
+        let mut nulls: Vec<bool> = vec![false; header_length];
 
         let mut records_count = 0;
 
@@ -379,13 +393,16 @@ impl Format {
             }
             records_count += 1;
 
-            // Note since we may be looking at a sample of the data, we make the safe assumption that
-            // they could be nullable
             for (i, column_type) in column_types.iter_mut().enumerate().take(header_length) {
                 if let Some(string) = record.get(i) {
-                    if !self.null_regex.is_null(string) {
+                    if self.null_regex.is_null(string) {
+                        nulls[i] = true;
+                    } else {
                         column_type.update(string)
                     }
+                } else {
+                    // A missing value (e.g. a truncated row) is treated as null
+                    nulls[i] = true;
                 }
             }
         }
@@ -394,7 +411,11 @@ impl Format {
         let fields: Fields = column_types
             .iter()
             .zip(&headers)
-            .map(|(inferred, field_name)| Field::new(field_name, inferred.get(), true))
+            .zip(&nulls)
+            .map(|((inferred, field_name), nullable)| {
+                let nullable = !self.strict_inference || *nullable;
+                Field::new(field_name, inferred.get(), nullable)
+            })
             .collect();
 
         Ok((Schema::new(fields), records_count))
@@ -1226,6 +1247,15 @@ impl ReaderBuilder {
         self
     }
 
+    /// Whether to use strict schema inference, defaults to `false`.
+    ///
+    /// See [`Format::with_strict_schema_inference`] for details. This only has an effect
+    /// when the schema is inferred rather than provided explicitly.
+    pub fn with_strict_schema_inference(mut self, strict: bool) -> Self {
+        self.format.strict_inference = strict;
+        self
+    }
+
     /// Create a new `Reader` from a non-buffered reader
     ///
     /// If `R: BufRead` consider using [`Self::build_buffered`] to avoid unnecessary additional
@@ -1525,6 +1555,53 @@ mod tests {
             .unwrap();
 
         assert_eq!("Aberdeen, Aberdeen City, UK", city.value(13));
+    }
+
+    #[test]
+    fn test_strict_schema_inference() {
+        let csv = "name,age,nickname\n\
+                   alice,20,\n\
+                   bob,30,bobby\n";
+
+        // By default every field is inferred as nullable.
+        let (schema, _) = Format::default()
+            .with_header(true)
+            .infer_schema(&mut Cursor::new(csv), None)
+            .unwrap();
+        assert!(schema.field(0).is_nullable());
+        assert!(schema.field(1).is_nullable());
+        assert!(schema.field(2).is_nullable());
+
+        // With strict inference, only columns that actually contained a null are nullable.
+        let (schema, _) = Format::default()
+            .with_header(true)
+            .with_strict_schema_inference(true)
+            .infer_schema(&mut Cursor::new(csv), None)
+            .unwrap();
+        assert_eq!(schema.field(0).name(), "name");
+        assert!(!schema.field(0).is_nullable());
+        assert_eq!(schema.field(1).name(), "age");
+        assert!(!schema.field(1).is_nullable());
+        // `nickname` has an empty value on the first row, so it remains nullable.
+        assert_eq!(schema.field(2).name(), "nickname");
+        assert!(schema.field(2).is_nullable());
+    }
+
+    #[test]
+    fn test_strict_schema_inference_custom_null_regex() {
+        let csv = "name,note\n\
+                   alice,NULL\n\
+                   bob,present\n";
+
+        let (schema, _) = Format::default()
+            .with_header(true)
+            .with_null_regex(Regex::new("^NULL$").unwrap())
+            .with_strict_schema_inference(true)
+            .infer_schema(&mut Cursor::new(csv), None)
+            .unwrap();
+        assert!(!schema.field(0).is_nullable());
+        // `note` contains a value matching the null regex, so it stays nullable.
+        assert!(schema.field(1).is_nullable());
     }
 
     #[test]
